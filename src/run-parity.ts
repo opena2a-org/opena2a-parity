@@ -69,6 +69,14 @@ function runCli(invocation: string, positionalArg: string | null): { exitCode: n
 // retries and then fails loudly through the normal comparison - transient is
 // smoothed, broken is still broken.
 const PROBE_RETRIES = 3;
+
+// What the retry is keyed on, in the retry's own log line, so the next reader does not assume it
+// covers shape. It does not: a participant that exits 0 with a well-formed document that lacks the
+// contract's must-match keys (measured: a registry miss falling through to a local scan, emitting
+// { type, score } where { found, trustLevel, verdict } were expected) is returned unretried and is
+// reported by runFixture as a SHAPE failure naming the absent keys.
+export const RETRY_CONDITION =
+  "keyed on an operational { error } payload or non-JSON output only; absent must-match keys are never retried";
 const PROBE_BACKOFF_MS = Number(process.env.PARITY_PROBE_BACKOFF_MS ?? 1500);
 
 function syncSleep(ms: number): void {
@@ -121,7 +129,7 @@ export function probeWithRetry(
     }
     const why = parseOk ? (parsed as { error?: unknown }).error : "non-JSON output";
     console.error(
-      `[${label}] transient probe failure (attempt ${attempt}/${PROBE_RETRIES}): ${String(why)}. Retrying in ${PROBE_BACKOFF_MS * attempt}ms...`,
+      `[${label}] transient probe failure (attempt ${attempt}/${PROBE_RETRIES}): ${String(why)}. Retrying in ${PROBE_BACKOFF_MS * attempt}ms... (${RETRY_CONDITION})`,
     );
     syncSleep(PROBE_BACKOFF_MS * attempt);
   }
@@ -208,6 +216,22 @@ function sortKeysReplacer() {
   };
 }
 
+// The contract keys a payload does not carry at all. Absence is the key resolving to undefined;
+// a present key holding null or a wrong value is a value question for the comparison, not a shape one.
+export function absentMustMatchKeys(parsed: unknown, mustMatch: string[]): string[] {
+  return mustMatch.filter((key) => getPath(parsed, key) === undefined);
+}
+
+// One line per participant, naming every absent key. Distinct from [FAIL] (value drift) on purpose:
+// a document of the wrong shape is not a drift of the right one, and it was never a retry candidate.
+export function shapeFailureReport(label: string, exitCode: number, absent: string[], total: number, errorField?: unknown): string {
+  const head = `[SHAPE] ${label}: exit=${exitCode}, ${absent.length} of ${total} must-match key(s) ABSENT from the payload: ${absent.join(", ")}`;
+  const why = errorField
+    ? `operational error payload after ${PROBE_RETRIES} attempts (error: ${String(errorField)})`
+    : "a well-formed document of a different shape (exit 0 is not evidence of the right work)";
+  return `${head}\n  ${why}; not retried: the retry is ${RETRY_CONDITION}`;
+}
+
 function diffKey(actual: unknown, golden: unknown, path: string): string | null {
   const a = getPath(actual, path);
   const g = getPath(golden, path);
@@ -272,6 +296,15 @@ function runFixture(fixtureName: string, bins: Record<CLI, string>): number {
 
     const actualPath = join(ACTUAL_DIR, fixtureName, `${cli}.json`);
     writeFileSync(actualPath, stableStringify(parsedVal));
+
+    const absent = absentMustMatchKeys(parsedVal, contract.must_match);
+    if (absent.length > 0) {
+      const errorField = isTransientProbeFailure(parsedVal) ? (parsedVal as { error?: unknown }).error : undefined;
+      console.error(`\n${shapeFailureReport(`${fixtureName} × ${cli}`, exitCode, absent, contract.must_match.length, errorField)}`);
+      console.error(`  (actual captured at ${join("actual", fixtureName, `${cli}.json`)})`);
+      failures += absent.length;
+      continue; // no golden comparison for a document of the wrong shape; the keys are named above
+    }
 
     results[cli] = { cli, exitCode, stdout, parsed: parsedVal };
   }
